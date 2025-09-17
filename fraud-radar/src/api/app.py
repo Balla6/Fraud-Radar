@@ -1,5 +1,5 @@
-# src/api/app.py
-import os, json, logging, numpy as np, pandas as pd
+\1from dotenv import load_dotenv
+load_dotenv()
 import joblib, mysql.connector as mc
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -18,17 +18,23 @@ NUM, CAT = CFG["num_feats"], CFG["cat_feats"]
 
 DEFAULT_TH = float(os.getenv("THRESHOLD", "0.07093"))
 
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_NAME = os.getenv("DB_NAME", "fraud_radar")
+DB_USER = os.getenv("DB_USER", "fraud_ro")
+DB_PASS = os.getenv("DB_PASS", "")
+
+def get_conn():
+    return mc.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME)
+
 app = FastAPI(title="Fraud Radar", version="0.1")
 
 class ScoreByTxID(BaseModel):
     tx_id: int
-    db_password: str
     threshold: Optional[float] = None
     explain: bool = False
 
 class ScoreMany(BaseModel):
     tx_ids: List[int] = Field(..., min_items=1, max_items=1000)
-    db_password: str
     threshold: Optional[float] = None
     explain: bool = False
 
@@ -37,34 +43,20 @@ def health():
     return {"ok": True}
 
 def _prep_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Coerce types, build derived columns, align to training columns."""
-    # 1) Coerce numeric features to float (handles Decimal from MySQL)
-    for c in NUM:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    # normalize types from MySQL
+    if "amount" in df.columns:
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").astype(float)
 
-    # 2) Coerce categoricals to string
-    for c in CAT:
-        if c in df.columns:
-            df[c] = df[c].astype("string").fillna("NA")
-
-    # 3) Derivations (now safe to use NumPy ufuncs)
-    df["amount"] = df["amount"].fillna(0.0)
-    df["high_amount_flag"] = (df["amount"].astype(float) > 200.0).astype(int)
-    df["log_amount"] = np.log1p(df["amount"].astype(float))
-
-    card_avg30 = pd.to_numeric(df["card_avg_amt_30d"], errors="coerce").replace(0, np.nan)
-    df["amt_over_card_avg30"] = (df["amount"].astype(float) / card_avg30).replace([np.inf, -np.inf], np.nan)
-
-    df["card_min_since_prev"] = pd.to_numeric(df["card_min_since_prev"], errors="coerce").fillna(1e6)
-    df["card_kmh_from_prev"]  = pd.to_numeric(df["card_kmh_from_prev"], errors="coerce").fillna(0.0)
-    df["device_age_days"]     = pd.to_numeric(df["device_age_days"], errors="coerce").clip(lower=0).fillna(0)
-    df["account_age_days"]    = pd.to_numeric(df["account_age_days"], errors="coerce").clip(lower=0).fillna(0)
-
-    # 4) One-hot + align
+    df["high_amount_flag"] = (df["amount"] > 200).astype(int)
+    df["log_amount"] = np.log1p(df["amount"].fillna(0))
+    df["amt_over_card_avg30"] = df["amount"] / (df["card_avg_amt_30d"].replace(0, np.nan))
+    df["amt_over_card_avg30"] = df["amt_over_card_avg30"].replace([np.inf, -np.inf], np.nan).fillna(0)
+    df["card_min_since_prev"] = df["card_min_since_prev"].fillna(1e6)
+    df["card_kmh_from_prev"]  = df["card_kmh_from_prev"].fillna(0)
+    df["device_age_days"]     = df["device_age_days"].clip(lower=0).fillna(0)
+    df["account_age_days"]    = df["account_age_days"].clip(lower=0).fillna(0)
     X = pd.get_dummies(df[NUM + CAT], columns=CAT)
-    X = X.reindex(columns=COLS, fill_value=0).astype(np.float32)
-    return X
+    return X.reindex(columns=COLS, fill_value=0).astype(np.float32)
 
 SELECT_COLUMNS = """
   tx_id, tx_time, amount,
@@ -83,8 +75,9 @@ SELECT_COLUMNS = """
 @app.post("/score_tx_id")
 def score_tx_id(req: ScoreByTxID):
     th = req.threshold if req.threshold is not None else DEFAULT_TH
+    # fetch one
     try:
-        conn = mc.connect(host="localhost", user="root", password=req.db_password, database="fraud_radar")
+        conn = get_conn()
         q = f"SELECT {SELECT_COLUMNS} FROM train_data_v11 WHERE tx_id = %s"
         df = pd.read_sql_query(q, conn, params=(req.tx_id,))
     finally:
@@ -94,7 +87,7 @@ def score_tx_id(req: ScoreByTxID):
         raise HTTPException(status_code=404, detail=f"tx_id {req.tx_id} not found")
 
     X = _prep_features(df)
-    proba = float(CAL.predict_proba(X)[:, 1][0])
+    proba = float(CAL.predict_proba(X)[:,1][0])
     result = {
         "tx_id": int(req.tx_id),
         "fraud_probability": round(proba, 6),
@@ -119,44 +112,27 @@ def score_tx_id(req: ScoreByTxID):
 @app.post("/score_many")
 def score_many(req: ScoreMany):
     th = req.threshold if req.threshold is not None else DEFAULT_TH
-
-    # de-dup but keep order
-    ids, seen = [], set()
-    for t in req.tx_ids:
-        ti = int(t)
-        if ti not in seen:
-            seen.add(ti)
-            ids.append(ti)
+    ids = list(dict.fromkeys(req.tx_ids))  # de-dup, preserve order
     if not ids:
         return {"threshold": th, "results": []}
-
     placeholders = ",".join(["%s"] * len(ids))
-    q = f"SELECT {SELECT_COLUMNS} FROM train_data_v11 WHERE tx_id IN ({placeholders})"
 
     try:
-        conn = mc.connect(host="localhost", user="root", password=req.db_password, database="fraud_radar")
-        cur = conn.cursor(dictionary=True)
-        cur.execute(q, ids)
-        rows = cur.fetchall()
-        cur.close(); conn.close()
-    except Exception as e:
-        log.exception("DB error in /score_many")
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+        conn = get_conn()
+        q = f"SELECT {SELECT_COLUMNS} FROM train_data_v11 WHERE tx_id IN ({placeholders})"
+        df = pd.read_sql_query(q, conn, params=tuple(ids))
+    finally:
+        try: conn.close()
+        except: pass
 
-    if not rows:
+    if df.empty:
         return {"threshold": th, "results": []}
 
-    df = pd.DataFrame(rows)
-    order = [i for i in ids if i in set(df["tx_id"].tolist())]
-    df = df.set_index("tx_id").loc[order].reset_index()
+    keep_order = [i for i in ids if i in set(df["tx_id"])]
+    df = df.set_index("tx_id").loc[keep_order].reset_index()
 
-    try:
-        X = _prep_features(df)
-        probs = CAL.predict_proba(X)[:, 1]
-    except Exception as e:
-        log.exception("Feature prep or prediction failed in /score_many")
-        raise HTTPException(status_code=500, detail=f"Inference error: {e}")
-
+    X = _prep_features(df)
+    probs = CAL.predict_proba(X)[:,1]
     out = []
     if req.explain and BASE is not None:
         try:
@@ -176,23 +152,14 @@ def score_many(req: ScoreMany):
                 })
         except Exception as e:
             log.warning(f"SHAP explanation failed (batch): {e}")
-            out = [{
-                "tx_id": int(tx),
-                "fraud_probability": round(float(p), 6),
-                "decision": "block" if p >= th else "allow"
-            } for tx, p in zip(df["tx_id"], probs)]
+            out = [{"tx_id": int(tx),
+                    "fraud_probability": round(float(p), 6),
+                    "decision": "block" if p >= th else "allow"} for tx, p in zip(df["tx_id"], probs)]
     else:
-        out = [{
-            "tx_id": int(tx),
-            "fraud_probability": round(float(p), 6),
-            "decision": "block" if p >= th else "allow"
-        } for tx, p in zip(df["tx_id"], probs)]
-
-    missing = [i for i in ids if i not in set(df["tx_id"])]
-    resp = {"threshold": th, "results": out}
-    if missing:
-        resp["missing_tx_ids"] = missing
-    return resp
+        out = [{"tx_id": int(tx),
+                "fraud_probability": round(float(p), 6),
+                "decision": "block" if p >= th else "allow"} for tx, p in zip(df["tx_id"], probs)]
+    return {"threshold": th, "results": out}
 
 @app.get("/metrics")
 def metrics():
@@ -206,3 +173,5 @@ def metrics():
         return last
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read metrics: {e}")
+
+

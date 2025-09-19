@@ -1,16 +1,34 @@
 # Fraud-Radar
 
-End-to-end mini fraud detection project:
+End-to-end **card-fraud detection** project designed to feel like a real production system:
 
-- Data → features in MySQL
-- Training (LightGBM + XGBoost baselines)
-- Cost-aware thresholding (≈ **1% FPR** operating point)
-- **FastAPI** scorer with **single** and **batch** endpoints, optional **SHAP** explanations
-- Exported, calibrated model + locked column list for stable inference
+- SQL features in **MySQL** (card/device/IP/merchant + rolling windows)
+- **LightGBM** model (XGBoost baseline), **probability calibration**
+- **Cost-aware thresholding** (operate around ~**1% FPR**)
+- **FastAPI** microservice with single & batch scoring and optional **SHAP** explanations
+- **Exported bundle** (model + locked column list) for serving parity
+- Secrets via **`.env`** (no passwords in code or requests)
 
-> ⚠️ **Security note:** This repo uses a `.env` file for local secrets.  
-> - Commit **`.env.example`** (safe placeholders).  
-> - **Do NOT commit `.env`** with real credentials.
+> ⚠️ **Security note**
+>
+> - Commit `.env.example` with placeholders  
+> - **Do NOT commit `.env`** with real credentials (already ignored by `.gitignore`)
+
+---
+
+## Table of contents
+
+- [Project structure](#project-structure)
+- [Quick start](#quick-start)
+- [API](#api)
+- [Training & export](#training--export)
+- [Data assumptions](#data-assumptions)
+- [Metrics & operating point](#metrics--operating-point)
+- [Reproducibility & safety](#reproducibility--safety)
+- [Development](#development)
+- [Roadmap](#roadmap)
+- [License](#license)
+- [Credits](#credits)
 
 ---
 
@@ -36,11 +54,7 @@ fraud-radar/
 ├─ requirements.txt
 └─ README.md
 
-yaml
-Copy code
-
 ---
-
 ## Quick start
 
 ### 1) Requirements
@@ -48,36 +62,43 @@ Copy code
 - Python **3.10**
 - MySQL **8.x**
 - Git Bash/PowerShell (Windows) or Bash (macOS/Linux)
-- Optional but recommended: a virtual environment
 
 ```bash
-# from repo root
+# create and activate a virtual environment
 python -m venv .venv
-# Windows (PowerShell): .\.venv\Scripts\Activate.ps1
+# Windows (PowerShell):
+.\.venv\Scripts\Activate.ps1
 # macOS/Linux:
-source .venv/bin/activate
-pip install -r requirements.txt
-2) Environment
-Copy the example env to a real one locally:
+# source .venv/bin/activate
 
-bash
+# install deps
+pip install -r requirements.txt
+```
+
+2) MySQL setup
+1. Copy the example env to a real one locally:
+
+
+```bash
 Copy code
 cp .env.example .env
-Edit .env on your machine (do not commit this file):
+```
 
-Replace DB_PASS=change_me with your local MySQL password.
+2. Edit .env on your machine (do not commit this file):
 
-Keep .env out of git (the repo’s .gitignore already does this).
+- Replace DB_PASS=change_me with your local MySQL password.
+
+- Keep .env out of git (the repo’s .gitignore already does this).
 
 .env.example (committed)
 
-ini
-Copy code
+```bash
 DB_HOST=127.0.0.1
 DB_NAME=fraud_radar
 DB_USER=fraud_ro
 DB_PASS=change_me
 THRESHOLD=0.07093
+```
 The API loads .env via python-dotenv. Real secrets never go in the README or in the repo.
 
 3) Start the API

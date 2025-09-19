@@ -252,3 +252,6 @@ Fraud-Radar/
 
 ## Built With
 MySQL 8 | Python 3.10 | pandas | scikit-learn | LightGBM | XGBoost | SHAP | FastAPI | Uvicorn | python-dotenv
+
+## License
+MIT

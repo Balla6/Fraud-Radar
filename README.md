@@ -1,133 +1,149 @@
-# Fraud-Radar
+# Fraud-Radar  
 
-End-to-end **card-fraud detection** project designed to feel like a real production system:
+**Author:** Balla Diaite  
+**Role:** Data Analyst | Data Scientist  
 
-- SQL features in **MySQL** (card/device/IP/merchant + rolling windows)
-- **LightGBM** model (XGBoost baseline), **probability calibration**
-- **Cost-aware thresholding** (operate around ~**1% FPR**)
-- **FastAPI** microservice with single & batch scoring and optional **SHAP** explanations
-- **Exported bundle** (model + locked column list) for serving parity
-- Secrets via **`.env`** (no passwords in code or requests)
-
-> ⚠️ **Security note**
->
-> - Commit `.env.example` with placeholders  
-> - **Do NOT commit `.env`** with real credentials (already ignored by `.gitignore`)
+**Project Overview:**  
+Fraud-Radar is a **production-style card-fraud detection system**. It turns raw transactional data into **real-time fraud risk scores**, exposes a **FastAPI** microservice with **single & batch** endpoints, and supports **cost-aware decisions** and **explanations**. The stack includes **MySQL**, **LightGBM/XGBoost**, **probability calibration**, and **SHAP**. Secrets are managed via **`.env`**—no passwords in code or requests.
 
 ---
 
-## Table of contents
-
-- [Project structure](#project-structure)
-- [Quick start](#quick-start)
-- [API](#api)
-- [Training & export](#training--export)
-- [Data assumptions](#data-assumptions)
-- [Metrics & operating point](#metrics--operating-point)
-- [Reproducibility & safety](#reproducibility--safety)
-- [Development](#development)
-- [Roadmap](#roadmap)
+## Table of Contents
+- [1. Data & Feature Engineering](#1-data--feature-engineering)
+- [2. Model Development](#2-model-development)
+- [3. Cost-Aware Thresholding](#3-costaware-thresholding)
+- [4. API Service (FastAPI)](#4-api-service-fastapi)
+- [5. Local Setup & Runbook](#5-local-setup--runbook)
+- [6. How to Use the API](#6-how-to-use-the-api)
+- [7. Key Results & Metrics](#7-key-results--metrics)
+- [8. Model Explainability (SHAP)](#8-model-explainability-shap)
+- [9. Versioning & Reproducibility](#9-versioning--reproducibility)
+- [10. Security & Secrets](#10-security--secrets)
+- [11. Project Structure](#11-project-structure)
+- [12. Future Improvements](#12-future-improvements)
+- [Built With](#built-with)
 - [License](#license)
-- [Credits](#credits)
 
 ---
 
-## Project structure
+## 1. Data & Feature Engineering
 
-fraud-radar/
-├─ artifacts/ # exported models & metadata (generated)
-│ ├─ model_v12.pkl # calibrated sklearn model bundle (LightGBM/XGB)
-│ ├─ feature_columns.json # exact training column order (after dummies)
-│ └─ feature_config.json # {"num_feats": [...], "cat_feats": [...]}
-├─ data/
-│ └─ raw/ # generated CSVs (ignored by git)
-├─ src/
-│ ├─ api/
-│ │ └─ app.py # FastAPI app (score_tx_id / score_many / metrics)
-│ ├─ models/
-│ │ ├─ train_lgbm_v11.py
-│ │ ├─ train_xgb_v12.py
-│ │ ├─ pick_threshold.py
-│ │ └─ export_model.py
-│ └─ ingest.py # (optional) synthesize CSVs or load data
-├─ .env.example # sample env file (safe to commit)
-├─ requirements.txt
-└─ README.md
+**Source:** MySQL 8 (local). The dataset contains ~**20,000** transactions with a fraud rate around **~5–6%** (highly imbalanced).  
+
+**Feature families (examples):**
+- **Transaction**: `amount`, `tx_time`, `night_time`, `country_mismatch`
+- **Card velocity**: `card_tx_24h`, `card_amt_24h`, `card_avg_24h`, `card_avg_amt_30d`, `card_min_since_prev`, `card_kmh_from_prev`, `impossible_speed`
+- **Device signals**: `device_tx_24h`, `device_tx_30d`, `device_card_count_7d`, `device_age_days`, `device_prior_fraud_30d`, `device_prior_fraud_rate_30d`
+- **IP signals**: `ip_tx_30d`, `ip_prior_fraud_30d`, `ip_prior_fraud_rate_30d`, `ip_card_count_7d`
+- **Merchant risk**: `merch_chargeback_rate_30d`, `merchant_risk`, `merchant_category`
+- **Account**: `account_age_days`
+- **Categoricals**: `merchant_category`, `device_os` (one-hot at training/serving)
+
+**At serving time**, the API:
+- Pulls the exact feature set via SQL (see `SELECT_COLUMNS` in `src/api/app.py`)
+- Applies the same preprocessing:
+  - `high_amount_flag`, `log_amount`
+  - `amt_over_card_avg30` with safe division
+  - Numeric coercion & NaN handling
+  - One-hot encoding + **reindex to `feature_columns.json`** so column order matches training
 
 ---
-## Quick start
 
-### 1) Requirements
+## 2. Model Development
 
-- Python **3.10**
-- MySQL **8.x**
-- Git Bash/PowerShell (Windows) or Bash (macOS/Linux)
+Two learners were benchmarked:
 
+- **LightGBM (winner)** — Tuned for imbalanced data, best **Recall @ 1% FPR**  
+- **XGBoost (baseline)** — Close in performance, used to validate approach
+
+**Probability calibration**  
+- Post-training calibration (isotonic/Platt) to improve probability quality  
+- Exported bundle: **`artifacts/model_v12.pkl`** includes **calibrated model** + **base model** (for SHAP)
+
+**Training scripts** (examples):
 ```bash
-# create and activate a virtual environment
-python -m venv .venv
-# Windows (PowerShell):
-.\.venv\Scripts\Activate.ps1
-# macOS/Linux:
-# source .venv/bin/activate
+# LightGBM (v11)
+python src/models/train_lgbm_v11.py
 
-# install deps
-pip install -r requirements.txt
+# XGBoost baseline (v12)
+python src/models/train_xgb_v12.py
 ```
-
-2) MySQL setup
-1. Copy the example env to a real one locally:
-
-
+## 3. Cost-Aware Thresholding
+We optimize the decision threshold to balance false positives (review cost) vs false negatives (fraud loss), with an FPR guardrail (~≤1%).
 ```bash
-Copy code
+python src/models/pick_threshold.py
+# outputs best thresholds and cost deltas; default served via THRESHOLD in .env
+```
+A typical selected threshold in this repo: 0.07093
+
+## 4. API Service (FastAPI)
+Why FastAPI?
+
+- Async, OpenAPI docs, easy to deploy.
+
+- Two scoring modes: single tx (/score_tx_id) and batch (/score_many).
+
+- Optional explainability via SHAP.
+
+Endpoints
+
+- GET /health — liveness
+
+- POST /score_tx_id — JSON: { "tx_id": <int>, "threshold": <float?>, "explain": <bool> }
+
+- POST /score_many — JSON: { "tx_ids": [<int>...], "threshold": <float?>, "explain": <bool> }
+
+- GET /metrics — last validation snapshot (val_scores.csv)
+
+## 5. Local Setup & Runbook
+5.1 Requirements
+```bash
+python -V  # 3.10+
+pip install fastapi uvicorn joblib numpy pandas scikit-learn lightgbm xgboost shap \
+            python-dotenv mysql-connector-python
+```
+5.2 MySQL (minimal)
+```bash
+CREATE DATABASE IF NOT EXISTS fraud_radar;
+
+-- Training/serving tables must exist (e.g., train_data_v11 with SELECT_COLUMNS)
+
+CREATE USER IF NOT EXISTS 'fraud_ro'@'localhost' IDENTIFIED BY 'YOUR_STRONG_PASSWORD';
+GRANT SELECT ON fraud_radar.* TO 'fraud_ro'@'localhost';
+FLUSH PRIVILEGES;
+```
+5.3 Environment
+```bash
 cp .env.example .env
 ```
-
-2. Edit .env on your machine (do not commit this file):
-
-- Replace DB_PASS=change_me with your local MySQL password.
-
-- Keep .env out of git (the repo’s .gitignore already does this).
-
-.env.example (committed)
-
+.env
 ```bash
 DB_HOST=127.0.0.1
 DB_NAME=fraud_radar
 DB_USER=fraud_ro
-DB_PASS=change_me
+DB_PASS=PASSWORD
 THRESHOLD=0.07093
 ```
-The API loads .env via python-dotenv. Real secrets never go in the README or in the repo.
+Note: .env is git-ignored. Only commit .env.example.
 
-3) Start the API
-bash
-Copy code
+5.4 Run the API
+```bash
 uvicorn src.api.app:app --reload
-# Docs: http://127.0.0.1:8000/docs
-Health check:
-
-bash
-Copy code
-curl http://127.0.0.1:8000/health
-API
-POST /score_tx_id
-Score a single transaction already present in train_data_v11 (MySQL).
-
-Request
-
-json
-Copy code
-{
-  "tx_id": 1772,
-  "threshold": 0.07093,
-  "explain": true
-}
-Response
-
-json
-Copy code
+# Swagger UI: http://127.0.0.1:8000/docs
+```
+## 6. How to Use the API
+Single transaction (with explanations)
+```bash
+curl -X POST "http://127.0.0.1:8000/score_tx_id" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "tx_id": 1772,
+        "threshold": 0.07093,
+        "explain": true
+      }'
+```
+Response (example)
+```bash
 {
   "tx_id": 1772,
   "fraud_probability": 0.158601,
@@ -139,119 +155,103 @@ Copy code
     "account_age_days": 1.6781
   }
 }
-POST /score_many
-Batch score by IDs (deduped; original order preserved).
-
-Request
-
-json
-Copy code
-{
-  "tx_ids": [1772, 2332, 2631],
-  "threshold": 0.07093,
-  "explain": true
-}
-Response
-
-json
-Copy code
-{
-  "threshold": 0.07093,
-  "results": [
-    { "tx_id": 1772, "fraud_probability": 0.158601, "decision": "block", "top_factors": { "amount": 2.6046, "merchant_risk": 1.7103, "account_age_days": 1.6781 } },
-    { "tx_id": 2332, "fraud_probability": 0.042118, "decision": "allow", "top_factors": { "merchant_risk": 1.9062, "amount": 1.1201, "amt_over_card_avg30": 0.8823 } },
-    { "tx_id": 2631, "fraud_probability": 0.083412, "decision": "block", "top_factors": { "merchant_risk": 2.0203, "amount": 1.1155, "device_tx_30d": 0.7741 } }
-  ]
-}
-GET /metrics
-Returns the last validation metrics (from artifacts/val_scores.csv) plus default threshold.
-
-Example
-
-json
-Copy code
-{
-  "PR_AUC": 0.0711,
-  "Recall@1%FPR": 0.0199,
-  "threshold": 0.07093
-}
-Training & export (summary)
-bash
-Copy code
-# Train LightGBM with feature set v11
-python src/models/train_lgbm_v11.py
-
-# Optional: XGBoost baseline
-python src/models/train_xgb_v12.py
-
-# Choose cost-aware threshold (balances FPR/recall under a simple cost model)
-python src/models/pick_threshold.py
-
-# Export calibrated model + locked column list
-python src/models/export_model.py
-# -> artifacts/model_v12.pkl, feature_columns.json, feature_config.json, val_scores.csv
-Why calibration & locked columns?
-
-Calibrated probabilities make thresholding meaningful (esp. at low FPR).
-
-Reindexing to feature_columns.json ensures serving matches training even when one-hot columns shift.
-
-Data assumptions
-Transactions & features are in MySQL database fraud_radar.
-
-Inference queries read from train_data_v11.
-
-Features include amounts, recent activity per card/device/IP, merchant risk, simple time flags, and engineered cols like:
-
-high_amount_flag, log_amount, amt_over_card_avg30, card_min_since_prev, card_kmh_from_prev, etc.
-
-The API coerces DB numerics to float and applies the same preprocessing as training.
-
-Example cURL
-bash
-Copy code
-# single
-curl -X POST "http://127.0.0.1:8000/score_tx_id" \
-  -H "Content-Type: application/json" \
-  -d '{"tx_id":1772,"threshold":0.07093,"explain":true}'
-
-# batch
+    }'
+```
+Batch scoring (3 IDs + explanations)
+```bash
 curl -X POST "http://127.0.0.1:8000/score_many" \
   -H "Content-Type: application/json" \
-  -d '{"tx_ids":[1772,2332,2631],"threshold":0.07093,"explain":true}'
-Development
-bash
-Copy code
-# run API locally
-uvicorn src.api.app:app --reload
+  -d '{
+        "tx_ids": [1772, 2332, 2631],
+        "threshold": 0.07093,
+        "explain": true
+      }'
 
-# format (optional)
-# pip install ruff black
-ruff check --fix .
-black .
+```
+## 7. Key Results & Metrics
+(Validation on hold-out set; fraud rate ~5–6%)
 
-# run tests (if/when added)
-pytest -q
-Secrets & repo hygiene
-Do not commit .env — use .env.example in the repo, and .env only on your machine.
+- LightGBM (best run):
 
-Use a read-only MySQL user for the API (DB_USER=fraud_ro).
+  - PR-AUC: ~0.07
 
-If deploying, inject env vars via your platform’s secret manager.
+  - Recall @ 1% FPR: ~1.6–2.0% (best seen ~1.99%)
 
-Benchmarks (current snapshot, synthetic data)
-LightGBM v11: PR_AUC ≈ 0.0711, Recall@1%FPR ≈ 0.0199
+  - Cost-aware threshold: ~0.07093 (guardrail ≤1% FPR)
 
-Suggested default threshold: THRESHOLD=0.07093
+- XGBoost (baseline):
 
-Expect to re-tune on real data.
+  - Similar PR-AUC, slightly lower recall @ 1% FPR in our runs
 
-License
-MIT (see LICENSE).
+  Numbers vary slightly across seeds/splits; the repo stores val_scores.csv for the last run and uses .env:THRESHOLD for serving.
 
-Credits
-Built with Python, MySQL, pandas, scikit-learn, LightGBM, XGBoost, FastAPI, and SHAP.
+Business framing: We optimize to catch more fraud while keeping false positive reviews low (≤1% FPR), and expose the calibrated probability for downstream risk policies.
 
-perl
+## 8. Model Explainability (SHAP)
 
+For transparency:
 
+- The API can attach top feature contributions per prediction ("explain": true).
+
+- Under the hood, we use the base model from the bundle with shap.TreeExplainer.
+
+- Explanations are local (per transaction) and ranked by absolute impact.
+
+When explanations are not needed, set "explain": false to minimize latency.
+
+## 9. Versioning & Reproducibility
+
+- Bundle export: artifacts/model_v12.pkl = calibrated model + base model
+
+- Locked columns: artifacts/feature_columns.json guarantees serving column order
+
+- Feature schema: artifacts/feature_config.json documents numeric/categorical splits
+
+- Metrics snapshot: artifacts/val_scores.csv read by /metrics
+
+## 10. Security & Secrets
+
+- Never put real credentials in code or README.
+
+- Commit .env.example only.
+
+- Real secrets live in local .env (git-ignored).
+
+- DB access uses a read-only user (fraud_ro) scoped to fraud_radar.
+
+## 11. Project Structure
+```bash
+Fraud-Radar/
+├─ artifacts/                    # exported models & metadata (git-ignored)
+│  ├─ model_v12.pkl             # calibrated bundle (with base model for SHAP)
+│  ├─ feature_columns.json      # exact training order after one-hot
+│  └─ feature_config.json       # {"num_feats": [...], "cat_feats": [...]}
+├─ data/
+│  └─ raw/                      # CSVs for DB load (git-ignored)
+├─ src/
+│  ├─ api/
+│  │  └─ app.py                 # FastAPI app (uses .env)
+│  ├─ models/
+│  │  ├─ train_lgbm_v11.py      # LightGBM training
+│  │  ├─ train_xgb_v12.py       # XGBoost baseline
+│  │  ├─ pick_threshold.py      # cost-aware threshold search
+│  │  └─ export_model.py        # bundle exporter (if retrained)
+│  └─ sql/                      # optional SQL helpers
+├─ .env.example                 # template for secrets
+├─ .gitignore
+└─ README.md
+```
+## 12. Future Improvements
+
+- Data scale-up (more merchants/devices/IPs) and richer networks (graph features)
+
+- Online learning / retraining cadence with model monitoring
+
+- Drift alerts (feature, label, performance) and champion/challenger setup
+
+- Auth & audit on the API (keys, rate limits, request logging)
+
+- Docker & CI/CD pipeline for reproducible deploys
+
+## Built With
+MySQL 8 | Python 3.10 | pandas | scikit-learn | LightGBM | XGBoost | SHAP | FastAPI | Uvicorn | python-dotenv

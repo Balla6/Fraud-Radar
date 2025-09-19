@@ -1,8 +1,5 @@
 # Fraud-Radar  
 
-**Author:** Balla Diaite  
-**Role:** Data Analyst | Data Scientist  
-
 **Project Overview:**  
 Fraud-Radar is a **production-style card-fraud detection system**. It turns raw transactional data into **real-time fraud risk scores**, exposes a **FastAPI** microservice with **single & batch** endpoints, and supports **cost-aware decisions** and **explanations**. The stack includes **MySQL**, **LightGBM/XGBoost**, **probability calibration**, and **SHAP**. Secrets are managed via **`.env`**—no passwords in code or requests.
 
